@@ -1,58 +1,79 @@
-import pvporcupine
-from pvrecorder import PvRecorder
+import sys
+import os
+import time
+import traceback
+import ctypes
 import pyautogui
 import win32gui
 import win32con
 import win32com.client
-import time
-import os
-import traceback
-import ctypes
+import pvporcupine
+from pvrecorder import PvRecorder
 from dotenv import load_dotenv
+
+# --- 核心改动：资源路径处理函数 ---
+def resource_path(relative_path):
+    """
+    获取资源绝对路径。
+    开发时：返回当前文件所在的目录/relative_path
+    打包后：返回 PyInstaller 临时目录(_MEIPASS)/relative_path
+    """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    return os.path.join(base_path, relative_path)
 
 # --- 配置区 ---
 
-# 1. 路径设置
-current_dir = os.path.dirname(os.path.abspath(__file__))
-env_path = os.path.join(current_dir, '.env')
-data_dir = os.path.join(current_dir, 'data')
+# 1. 路径设置 (全部使用 resource_path 包裹)
+# 注意：打包时会将 data 文件夹里的东西平铺或保持结构，这里假设保持结构
+IMG_CALL = resource_path('call.png')      
+IMG_HANGUP = resource_path('hangup.png')  
 
-# 图片路径 (建议重新截图，只截取按钮本身，不含背景)
-IMG_CALL = os.path.join(current_dir, 'call.png')      
-IMG_HANGUP = os.path.join(current_dir, 'hangup.png')  
-
-# 模型路径
-MODEL_PATH_CALL = os.path.join(data_dir, '你好豆包_zh_windows_v4_0_0.ppn')
-MODEL_PATH_HANGUP = os.path.join(data_dir, '再见吧_zh_windows_v4_0_0.ppn')
-MODEL_PATH_PARAMS = os.path.join(data_dir, 'porcupine_params_zh.pv')
+MODEL_PATH_CALL = resource_path(os.path.join('data', '你好豆包_zh_windows_v4_0_0.ppn'))
+MODEL_PATH_HANGUP = resource_path(os.path.join('data', '再见吧_zh_windows_v4_0_0.ppn'))
+MODEL_PATH_PARAMS = resource_path(os.path.join('data', 'porcupine_params_zh.pv'))
 
 # 2. 加载环境变量
-load_dotenv(env_path)
+# 如果你希望用户在 exe 旁边放 .env 文件，用 os.getcwd()
+# 如果你希望 .env 打包进 exe 内部（不安全，不推荐），用 resource_path
+# 这里采用：优先读取 exe 同级目录下的 .env，方便用户修改 Key
+env_path_external = os.path.join(os.getcwd(), '.env')
+env_path_internal = resource_path('.env')
+
+if os.path.exists(env_path_external):
+    load_dotenv(env_path_external)
+    print(f"加载外部配置: {env_path_external}")
+else:
+    load_dotenv(env_path_internal)
+    print("加载内部默认配置")
+
 PICOVOICE_API_KEY = os.getenv("PICOVOICE_API_KEY")
 
 if not PICOVOICE_API_KEY:
-    raise ValueError("错误：未找到 PICOVOICE_API_KEY，请检查 .env 文件。")
+    # 增加 input 防止报错后窗口秒关，用户看不到报错
+    print("错误：未找到 PICOVOICE_API_KEY，请在 .env 文件中配置。")
+    input("按回车键退出...")
+    sys.exit(1)
 
-# 3. 窗口标题 (必须准确，可以用 Spy++ 或简单的 print 脚本确认)
+# 3. 窗口标题
 WINDOW_TITLE = "豆包"
 
-# --- 核心功能区 ---
+# --- 核心功能区 (保持不变，仅修正打印逻辑) ---
 
-# 强制开启 DPI 感知，防止坐标偏移
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:
     ctypes.windll.user32.SetProcessDPIAware()
 
 class WindowManager:
-    """封装 Windows API 用于窗口控制"""
-    
     def __init__(self, title_keyword):
         self.title_keyword = title_keyword
         self.hwnd = None
 
     def find_window(self):
-        """查找包含指定标题的窗口句柄"""
         self.hwnd = None
         win32gui.EnumWindows(self._enum_cb, None)
         return self.hwnd
@@ -64,58 +85,43 @@ class WindowManager:
                 self.hwnd = hwnd
 
     def activate_and_get_region(self):
-        """激活窗口并返回其坐标区域 (left, top, width, height)"""
         if not self.find_window():
             print(f"   [错误] 未找到标题包含 '{self.title_keyword}' 的窗口")
             return None
 
         try:
-            # 1. 如果最小化了，还原它
             if win32gui.IsIconic(self.hwnd):
                 win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
             
-            # 2. 强力置顶 (使用 Shell Hack 防止被 Windows 拦截)
             shell = win32com.client.Dispatch("WScript.Shell")
-            shell.SendKeys('%') # 发送 Alt 键欺骗系统
+            shell.SendKeys('%') 
             win32gui.SetForegroundWindow(self.hwnd)
             
-            # 3. 等待窗口动画结束
             time.sleep(0.2)
             
-            # 4. 获取窗口坐标
             rect = win32gui.GetWindowRect(self.hwnd)
             x, y, x2, y2 = rect
             w = x2 - x
             h = y2 - y
-            
             return (x, y, w, h)
-            
         except Exception as e:
             print(f"   [窗口激活失败] {e}")
             return None
 
-# 初始化窗口管理器
 doubao_win = WindowManager(WINDOW_TITLE)
 
 def smart_click(img_path, action_name):
     print(f"\n--- 执行指令：{action_name} ---")
-    
-    # 1. 尝试激活窗口并获取区域
     region = doubao_win.activate_and_get_region()
     
     if not region:
-        print("   无法定位窗口，放弃操作。")
         return
-
-    print(f"   窗口区域锁定: {region}")
 
     try:
         if not os.path.exists(img_path):
-            print(f"   [错误] 图片不存在: {img_path}")
+            print(f"   [错误] 图片资源丢失: {img_path}")
             return
 
-        # 2. 在指定区域内找图 (Region 限制搜索范围)
-        # grayscale=True: 忽略按钮高亮色差
         location = pyautogui.locateOnScreen(
             img_path, 
             region=region, 
@@ -124,24 +130,19 @@ def smart_click(img_path, action_name):
         )
         
         if location:
-            # 3. 获取中心坐标 (pyautogui 返回的是屏幕绝对坐标)
             x, y = pyautogui.center(location)
-            print(f"   -> 锁定按钮坐标: ({x}, {y})")
+            print(f"   -> 锁定坐标: ({x}, {y})")
             
-            # 4. 执行点击动作
             pyautogui.moveTo(x, y, duration=0.2)
             pyautogui.mouseDown()
-            time.sleep(0.1) # 模拟按压
+            time.sleep(0.1)
             pyautogui.mouseUp()
-            print(f"   -> {action_name} 点击完成")
             
-            # 5. 【关键】鼠标归位
-            # 移到屏幕左上角 (10, 10)，防止遮挡或残留 Hover 状态
             time.sleep(0.1)
             pyautogui.moveTo(10, 10, duration=0.1)
-            
+            print(f"   -> {action_name} 成功")
         else:
-            print(f"   [查找失败] 在窗口内未找到图标。请检查截图是否准确。")
+            print(f"   [失败] 窗口内未找到图标")
             
     except Exception as e:
         print(f"   [异常] {e}")
@@ -150,9 +151,8 @@ def smart_click(img_path, action_name):
 
 def main():
     try:
-        # 检查模型文件
         if not os.path.exists(MODEL_PATH_PARAMS):
-            raise FileNotFoundError("找不到中文模型文件 porcupine_params_zh.pv")
+            raise FileNotFoundError(f"模型文件丢失: {MODEL_PATH_PARAMS}")
 
         porcupine = pvporcupine.create(
             access_key=PICOVOICE_API_KEY, 
@@ -160,17 +160,20 @@ def main():
             model_path=MODEL_PATH_PARAMS
         )
         
-        print("Picovoice 初始化成功！") 
+        print(f"Picovoice 初始化成功！") 
 
     except Exception as e:
         print(f"初始化失败: {e}")
+        input("按回车键退出...") # 防止闪退
         return
 
     recorder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
     
-    print(f"=== 语音助手 (主窗口模式) 运行中 ===")
-    print(f"1. 说 '你好豆包' -> 激活窗口并拨打")
-    print(f"2. 说 '再见吧'   -> 激活窗口并挂断")
+    print(f"=== 语音助手 (v1.0) 启动成功 ===")
+    print(f"配置文件路径: {env_path_external}")
+    print(f"1. 说 '你好豆包' -> 拨打")
+    print(f"2. 说 '再见吧'   -> 挂断")
+    print(f"(请勿关闭此窗口，Ctrl+C 可退出)")
     
     try:
         recorder.start()
@@ -190,6 +193,10 @@ def main():
 
     except KeyboardInterrupt:
         print("\n停止")
+    except Exception as e:
+        print(f"\n运行时错误: {e}")
+        traceback.print_exc()
+        input("按回车键退出...")
     finally:
         if 'recorder' in locals(): recorder.stop(); recorder.delete()
         if 'porcupine' in locals(): porcupine.delete()
