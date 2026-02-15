@@ -1,0 +1,17 @@
+# 语音识别与录音
+pvporcupine
+pvrecorder
+
+# 环境变量加载
+python-dotenv
+
+# GUI 自动化与图像识别
+pyautogui
+# PyAutoGUI 使用 confidence 参数必须依赖 OpenCV
+opencv-python
+
+# Windows 窗口控制 API
+pywin32
+
+# 打包工具 (开发环境需要，可选)
+pyinstaller
