@@ -1,0 +1,1 @@
+语音功能依赖网站：https://console.picovoice.ai/
