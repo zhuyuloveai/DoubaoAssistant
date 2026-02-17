@@ -25,6 +25,12 @@ def resource_path(relative_path):
 
     return os.path.join(base_path, relative_path)
 
+def get_runtime_dir():
+    """运行时目录：开发为脚本目录；打包为 exe 所在目录。"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 
 def get_resources_root():
     """
@@ -45,6 +51,26 @@ def get_resources_root():
         f"请在以下路径旁放置 resources 目录：{exe_dir}\n"
         "示例：resources/call/*.png、resources/hangup/*.png"
     )
+
+def _debug_enabled():
+    v = os.getenv("DOUBAO_DEBUG_VISION", "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+def _ensure_debug_dir():
+    d = os.path.join(get_runtime_dir(), "debug")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        return None
+    return d
+
+def _safe_image_size(img_path: str):
+    try:
+        from PIL import Image
+        with Image.open(img_path) as im:
+            return im.size
+    except Exception:
+        return None
 
 
 # 支持的图片扩展名
@@ -197,16 +223,40 @@ def smart_click(image_paths, action_name):
         print(f"   [错误] 场景无图片资源，请检查 resources 目录下对应场景文件夹")
         return
 
+    print(f"   -> 搜索区域(region): {region}")
+    print(f"   -> 待尝试图片数: {len(image_paths)}")
+    if _debug_enabled():
+        try:
+            print(f"   [DEBUG] runtime_dir: {get_runtime_dir()}")
+            print(f"   [DEBUG] resources_root: {get_resources_root()}")
+            print(f"   [DEBUG] screen_size: {pyautogui.size()}")
+        except Exception as e_dbg:
+            print(f"   [DEBUG] basic info failed: {type(e_dbg).__name__} | {e_dbg!r}")
+
     try:
-        for img_path in image_paths:
+        for idx, img_path in enumerate(image_paths, start=1):
             if not os.path.exists(img_path):
+                print(f"   [跳过] 文件不存在: {img_path}")
                 continue
-            location = pyautogui.locateOnScreen(
-                img_path, 
-                region=region, 
-                confidence=0.8,
-                grayscale=True 
-            )
+
+            try:
+                location = pyautogui.locateOnScreen(
+                    img_path,
+                    region=region,
+                    confidence=0.8,
+                    grayscale=True
+                )
+            except pyautogui.ImageNotFoundException:
+                # PyAutoGUI 新版本可能会在“未命中”时抛异常；这不是运行错误，视为未找到
+                location = None
+            except Exception as e_img:
+                print(
+                    f"   [异常] locateOnScreen 运行错误 ({idx}/{len(image_paths)}): "
+                    f"{os.path.basename(img_path)} | {type(e_img).__name__} | {e_img!r}"
+                )
+                traceback.print_exc()
+                continue
+
             if location:
                 x, y = pyautogui.center(location)
                 print(f"   -> 使用: {os.path.basename(img_path)} 锁定坐标: ({x}, {y})")
@@ -218,9 +268,28 @@ def smart_click(image_paths, action_name):
                 pyautogui.moveTo(10, 10, duration=0.1)
                 print(f"   -> {action_name} 成功")
                 return
+            else:
+                if _debug_enabled():
+                    sz = _safe_image_size(img_path)
+                    if sz:
+                        print(f"   [DEBUG] miss ({idx}/{len(image_paths)}): {os.path.basename(img_path)} size={sz}")
+                    else:
+                        print(f"   [DEBUG] miss ({idx}/{len(image_paths)}): {os.path.basename(img_path)}")
+
         print(f"   [失败] 窗口内未找到图标（已尝试 {len(image_paths)} 张图）")
+        if _debug_enabled():
+            debug_dir = _ensure_debug_dir()
+            if debug_dir:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                try:
+                    snap_path = os.path.join(debug_dir, f"{action_name}_region_{ts}.png")
+                    pyautogui.screenshot(snap_path, region=region)
+                    print(f"   [DEBUG] saved region screenshot: {snap_path}")
+                except Exception as e_shot:
+                    print(f"   [DEBUG] save screenshot failed: {type(e_shot).__name__} | {e_shot!r}")
     except Exception as e:
-        print(f"   [异常] {e}")
+        print(f"   [异常] smart_click 崩溃: {type(e).__name__} | {e!r}")
+        traceback.print_exc()
 
 # --- 主程序 ---
 
@@ -249,20 +318,41 @@ def main():
     print(f"1. 说 '你好豆包' -> 拨打")
     print(f"2. 说 '再见吧'   -> 挂断")
     print(f"(请勿关闭此窗口，Ctrl+C 可退出)")
+    print(f"(提示：为避免启动瞬间误触发，前 2 秒会忽略唤醒词)")
     
     try:
         recorder.start()
+        start_ts = time.time()
+        last_trigger_ts = 0.0
+        arm_delay_seconds = float(os.getenv("ARM_DELAY_SECONDS", "2.0") or "2.0")
+        cooldown_seconds = float(os.getenv("COMMAND_COOLDOWN_SECONDS", "1.5") or "1.5")
         while True:
             pcm = recorder.read()
             keyword_index = porcupine.process(pcm)
             
             if keyword_index == 0:
+                now = time.time()
+                if now - start_ts < arm_delay_seconds:
+                    continue
+                if now - last_trigger_ts < cooldown_seconds:
+                    continue
+                last_trigger_ts = now
                 print(f"\n[听到: 你好豆包]")
                 smart_click(get_scene_image_paths('call'), "拨打")
                 time.sleep(1.0)
                 
             elif keyword_index == 1:
+                now = time.time()
+                if now - start_ts < arm_delay_seconds:
+                    continue
+                if now - last_trigger_ts < cooldown_seconds:
+                    continue
+                last_trigger_ts = now
                 print(f"\n[听到: 再见吧]")
+                hangup_delay_seconds = float(os.getenv("HANGUP_DELAY_SECONDS", "5.0") or "5.0")
+                if hangup_delay_seconds > 0:
+                    print(f"   -> 将在 {hangup_delay_seconds:.1f} 秒后挂断（等待豆包说完告别语）")
+                    time.sleep(hangup_delay_seconds)
                 smart_click(get_scene_image_paths('hangup'), "挂断")
                 time.sleep(1.0)
 
