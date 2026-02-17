@@ -21,8 +21,6 @@ a = Analysis(
     pathex=[],
     binaries=all_binaries,  # 使用合并后的 binaries
     datas=all_datas + [     # 使用合并后的 datas，加上你自己的资源
-        ('call.png', '.'), 
-        ('hangup.png', '.'),
         ('.env', '.'),     
         ('data', 'data'),  
     ],

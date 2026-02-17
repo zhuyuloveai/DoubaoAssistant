@@ -3,3 +3,4 @@ venv/
 *.zip
 build/
 dist/
+release/

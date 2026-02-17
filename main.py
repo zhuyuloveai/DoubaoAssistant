@@ -25,12 +25,84 @@ def resource_path(relative_path):
 
     return os.path.join(base_path, relative_path)
 
+
+def get_resources_root():
+    """
+    获取资源根目录（与 exe 解耦）。
+    开发时：使用与 main.py 同级的 resources/
+    打包后：使用与 exe 同级的 resources/
+    注意：resources 不再打包进 exe 内部；如果缺失则直接报错提示。
+    """
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+    external = os.path.join(exe_dir, 'resources')
+    if os.path.isdir(external):
+        return external
+    raise FileNotFoundError(
+        "未找到资源目录 resources/。\n"
+        f"请在以下路径旁放置 resources 目录：{exe_dir}\n"
+        "示例：resources/call/*.png、resources/hangup/*.png"
+    )
+
+
+# 支持的图片扩展名
+IMG_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
+
+
+def _collect_images_from_dir(directory, skip_subdir_name=None):
+    """从目录递归收集图片路径，可跳过指定子目录名（避免重复）。"""
+    out = []
+    try:
+        names = sorted(os.listdir(directory))
+        for name in names:
+            full = os.path.join(directory, name)
+            if os.path.isfile(full) and os.path.splitext(name)[1].lower() in IMG_EXTENSIONS:
+                out.append(full)
+        for name in names:
+            if name == skip_subdir_name:
+                continue
+            full = os.path.join(directory, name)
+            if os.path.isdir(full):
+                out.extend(_collect_images_from_dir(full, None))
+    except OSError:
+        pass
+    return out
+
+
+def get_scene_image_paths(scene_name):
+    """
+    按场景名获取该场景下所有图片路径（含子目录），用于多分辨率遍历匹配。
+    scene_name: 场景目录名，如 'call'、'hangup'
+    返回: 有序列表，优先当前分辨率子目录（如 1920x1080），再根目录及其余子目录
+    """
+    root = get_resources_root()
+    scene_dir = os.path.join(root, scene_name)
+    if not os.path.isdir(scene_dir):
+        return []
+
+    res_subdir = None
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        res_subdir = f"{w}x{h}"
+    except Exception:
+        pass
+
+    paths = []
+    res_subdir_path = os.path.join(scene_dir, res_subdir) if res_subdir else None
+    if res_subdir_path and os.path.isdir(res_subdir_path):
+        paths.extend(_collect_images_from_dir(res_subdir_path))
+    paths.extend(_collect_images_from_dir(scene_dir, res_subdir))
+    return paths
+
+
 # --- 配置区 ---
 
 # 1. 路径设置 (全部使用 resource_path 包裹)
-# 注意：打包时会将 data 文件夹里的东西平铺或保持结构，这里假设保持结构
-IMG_CALL = resource_path('call.png')      
-IMG_HANGUP = resource_path('hangup.png')  
+# 图片资源已迁移到 resources/<场景名>/，见 get_resources_root、get_scene_image_paths  
 
 MODEL_PATH_CALL = resource_path(os.path.join('data', '你好豆包_zh_windows_v4_0_0.ppn'))
 MODEL_PATH_HANGUP = resource_path(os.path.join('data', '再见吧_zh_windows_v4_0_0.ppn'))
@@ -110,40 +182,43 @@ class WindowManager:
 
 doubao_win = WindowManager(WINDOW_TITLE)
 
-def smart_click(img_path, action_name):
+def smart_click(image_paths, action_name):
+    """
+    在窗口区域内依次尝试 image_paths 中的图片，直到某张匹配则点击。
+    image_paths: 图片路径列表（通常来自 get_scene_image_paths(scene_name)）
+    """
     print(f"\n--- 执行指令：{action_name} ---")
     region = doubao_win.activate_and_get_region()
     
     if not region:
         return
 
-    try:
-        if not os.path.exists(img_path):
-            print(f"   [错误] 图片资源丢失: {img_path}")
-            return
+    if not image_paths:
+        print(f"   [错误] 场景无图片资源，请检查 resources 目录下对应场景文件夹")
+        return
 
-        location = pyautogui.locateOnScreen(
-            img_path, 
-            region=region, 
-            confidence=0.8,
-            grayscale=True 
-        )
-        
-        if location:
-            x, y = pyautogui.center(location)
-            print(f"   -> 锁定坐标: ({x}, {y})")
-            
-            pyautogui.moveTo(x, y, duration=0.2)
-            pyautogui.mouseDown()
-            time.sleep(0.1)
-            pyautogui.mouseUp()
-            
-            time.sleep(0.1)
-            pyautogui.moveTo(10, 10, duration=0.1)
-            print(f"   -> {action_name} 成功")
-        else:
-            print(f"   [失败] 窗口内未找到图标")
-            
+    try:
+        for img_path in image_paths:
+            if not os.path.exists(img_path):
+                continue
+            location = pyautogui.locateOnScreen(
+                img_path, 
+                region=region, 
+                confidence=0.8,
+                grayscale=True 
+            )
+            if location:
+                x, y = pyautogui.center(location)
+                print(f"   -> 使用: {os.path.basename(img_path)} 锁定坐标: ({x}, {y})")
+                pyautogui.moveTo(x, y, duration=0.2)
+                pyautogui.mouseDown()
+                time.sleep(0.1)
+                pyautogui.mouseUp()
+                time.sleep(0.1)
+                pyautogui.moveTo(10, 10, duration=0.1)
+                print(f"   -> {action_name} 成功")
+                return
+        print(f"   [失败] 窗口内未找到图标（已尝试 {len(image_paths)} 张图）")
     except Exception as e:
         print(f"   [异常] {e}")
 
@@ -183,12 +258,12 @@ def main():
             
             if keyword_index == 0:
                 print(f"\n[听到: 你好豆包]")
-                smart_click(IMG_CALL, "拨打")
+                smart_click(get_scene_image_paths('call'), "拨打")
                 time.sleep(1.0)
                 
             elif keyword_index == 1:
                 print(f"\n[听到: 再见吧]")
-                smart_click(IMG_HANGUP, "挂断")
+                smart_click(get_scene_image_paths('hangup'), "挂断")
                 time.sleep(1.0)
 
     except KeyboardInterrupt:
